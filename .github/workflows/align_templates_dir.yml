@@ -8,6 +8,10 @@ on:
       - templates/**
 
   workflow_dispatch:
+    inputs:
+      pr_number:
+        required: true
+        type: number
 
 jobs:
 
@@ -32,8 +36,8 @@ jobs:
       # templates/_templating_scripting.py only needs builtins to run.
       uses: actions/setup-python@v5
 
-    - name: Diff and Create GitHub Issues
-      id: create_issues
+    - name: Check templates/ dir
+      id: check_dir
       env:
         GITHUB_TOKEN: ${{ steps.generate_token.outputs.token }}
-      run: templates/_templating_scripting.py notify-updates
+      run: templates/_templating_scripting.py check_dir ${{ inputs.pr_number }}
