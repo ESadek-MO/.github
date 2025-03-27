@@ -276,6 +276,34 @@ def prompt_share(args: argparse.Namespace) -> None:
             else:
                 continue
 
+def check_dir(args: argparse.Namespace) -> None:
+    """
+    x = get all changed file names in templates directory
+    y = dictionary from _templating_config.json
+    if x not in y:
+        request changes on the PR
+    """
+    def git_diff(*args: str) -> str:
+        command = "diff HEAD^ HEAD " + " ".join(args)
+        return git_command(command)
+
+    pr_number = args.pr_number
+
+    git_root = Path(git_command("rev-parse --show-toplevel")).resolve()
+    diff_output = git_diff("--name-only")
+    changed_files = [git_root / line for line in diff_output.splitlines()]
+    changed_templates = [
+        file for file in changed_files if file.is_relative_to(TEMPLATES_DIR)
+    ]
+    for template in changed_templates:
+        if template not in CONFIG.templates:
+            review_body = f"{template} is not found in _templating_config.json."
+            gh_command = shlex.split(
+                f'gh pr review {pr_number} --request-changes --body "{review_body}"'
+            )
+            run(gh_command, check=True)
+
+
 
 def check_dir(args: argparse.Namespace) -> None:
     # Ensures templates/ dir aligns with _templating_config.json.
