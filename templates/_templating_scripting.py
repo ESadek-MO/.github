@@ -2,23 +2,61 @@
 """Commands and scripts for administrating templating of files across SciTools repos.
 """
 import argparse
+import contextlib
+from enum import StrEnum
+from hashlib import sha256
 import json
 from pathlib import Path
+import re
 import shlex
 from subprocess import CalledProcessError, check_output, run
 from tempfile import NamedTemporaryFile
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 from urllib.parse import urlparse
 
+# A mechanism for disabling the issues and comments if the dev team is
+#  deliberately doing intense work on templates and templated files (the volume
+#  of un-actioned notifications would be overwhelming).
+SPRING_CLEANING = False
 
 SCITOOLS_URL = "https://github.com/SciTools"
 TEMPLATES_DIR = Path(__file__).parent.resolve()
 TEMPLATE_REPO_ROOT = TEMPLATES_DIR.parent
+# ensure any new bots have both a "app/" prefix and a "[bot]" postfix version
+BOTS = [
+    "dependabot[bot]",
+    "app/dependabot",
+    "pre-commit-ci[bot]",
+    "app/pre-commit-ci",
+    "app/scitools-ci",
+    "web-flow",
+]
+TEMPLATING_HEADING = (
+    "[TEMPLATING WATERMARK]: #\n\n"
+    f"## [Templating]({SCITOOLS_URL}/.github/blob/main/templates)"
+)
+
+_MAGIC_PREFIX = "@scitools-templating: please"
+MAGIC_NO_PROMPT = re.compile(rf"{_MAGIC_PREFIX} no share prompt", re.IGNORECASE)
+MAGIC_NO_NOTIFY = re.compile(rf"{_MAGIC_PREFIX} no update notification on: ([\w-]+)", re.IGNORECASE)
+
+
+class ReviewType(StrEnum):
+    APPROVE = "approve"
+    COMMENT = "comment"
+    REQUEST_CHANGES = "request-changes"
 
 
 def git_command(command: str) -> str:
     command = shlex.split(f"git {command}")
     return check_output(command).decode("utf-8").strip()
+
+
+def gh_json(sub_command: str, field: Optional[str] = None) -> dict:
+    command = f"gh {sub_command}"
+    if field:
+        command += f" --json {field}"
+    return json.loads(check_output(shlex.split(command)))
 
 
 class Config:
@@ -28,12 +66,14 @@ class Config:
         path_in_repo: Path
 
     def __init__(self):
-        with (TEMPLATES_DIR / "_templating_config.json").open() as file_read:
+        with (TEMPLATES_DIR / "_templating_include.json").open() as file_read:
             config = json.load(file_read)
 
         self.templates: dict[Path, list[Config.TargetRepo]] = {}
 
         for _template, _target_repos in config.items():
+            if _template == "__comment__":
+                continue
             template = TEMPLATES_DIR / _template
             assert template.is_file(), f"{template} does not exist."
             target_repos = [
@@ -70,6 +110,26 @@ def notify_updates(args: argparse.Namespace) -> None:
     # Always passed (by common code), but never used in this routine.
     _ = args
 
+    if SPRING_CLEANING:
+        print(
+            "Spring cleaning is in effect; no issues/comments will be posted."
+        )
+        return
+
+    # Check if the commit's PR (if applicable) had a magic no-notify comment.
+    repo_exclude = ""  # Default to no repo exclusion.
+    commit_sha = git_command("rev-parse HEAD")
+    pr_list = gh_json(
+        f"pr list --search {commit_sha} --state merged --json number", "number"
+    )
+    if pr_list:
+        (pr,) = pr_list
+        pr_number = pr["number"]
+        pr_body = gh_json(f"pr view {pr_number}", "body")["body"]
+        search = MAGIC_NO_NOTIFY.search(pr_body)
+        with contextlib.suppress(AttributeError, IndexError):
+            repo_exclude = search.group(1)
+
     def git_diff(*args: str) -> str:
         command = "diff HEAD^ HEAD " + " ".join(args)
         return git_command(command)
@@ -80,6 +140,9 @@ def notify_updates(args: argparse.Namespace) -> None:
     changed_templates = [
         file for file in changed_files if file.is_relative_to(TEMPLATES_DIR)
     ]
+
+    # DEBUG
+    # changed_templates = [TEMPLATES_DIR / "LICENSE"]
 
     for template in changed_templates:
         templatees = CONFIG.templates[template]
@@ -95,14 +158,23 @@ def notify_updates(args: argparse.Namespace) -> None:
         )
         template_link = f"[`{template_relative}`]({template_url})"
         for repo, path_in_repo in templatees:
+            if repo.casefold() == repo_exclude.casefold():
+                print(
+                    f"Skipping {repo} because it is excluded by the magic "
+                    "no-notify comment."
+                )
+                continue
+
             file_url = f"{SCITOOLS_URL}/{repo}/blob/main/{path_in_repo}"
             file_link = f"[`{path_in_repo}`]({file_url})"
             issue_body = (
+                f"{TEMPLATING_HEADING}\n\n"
+                
                 f"The template for `{path_in_repo}` has been updated; see the "
                 "diff below. Please either:\n\n"
                 
                 "- Action this issue with a pull request applying some/all of "
-                f"these changes to `{path_in_repo}`.\n"
+                f"these changes to `{path_in_repo}`[^1].\n"
                 "- Close this issue if _none_ of these changes are appropriate "
                 "for this repo.\n\n"
                 "Also consider reviewing a full diff between the template and "
@@ -115,7 +187,11 @@ def notify_updates(args: argparse.Namespace) -> None:
                 # TODO: a link to the whole diff compared to the template?
 
                 "## Diff\n\n"
-                f"```diff\n{diff}\n```"
+                f"```diff\n{diff}\n```\n\n"
+                
+                "[^1]: **Include this text in the PR body to avoid any prompts "
+                "about applying your changes back to the template!**\n"
+                f"``{MAGIC_NO_PROMPT.pattern}``"
             )
             with NamedTemporaryFile("w") as file_write:
                 file_write.write(issue_body)
@@ -147,35 +223,43 @@ def prompt_share(args: argparse.Namespace) -> None:
 
     This function is intended for running on a PR on a 'target repo'.
     """
-    def gh_json(sub_command: str, field: str) -> dict:
-        command = shlex.split(f"gh {sub_command} --json {field}")
-        return json.loads(check_output(command))
+    if SPRING_CLEANING:
+        print(
+            "Spring cleaning is in effect; no issues/comments will be posted."
+        )
+        return
 
     pr_number = args.pr_number
+    # Can use a URL here for local debugging:
+    # pr_number = "https://github.com/SciTools/iris/pull/6901"
+
+    body = gh_json(f"pr view {pr_number}", "body")["body"]
+    if MAGIC_NO_PROMPT.search(body):
+        print(
+            f"Skipping PR {pr_number} because the body contains the magic "
+            "no-share-prompt comment."
+        )
+        return
 
     def split_github_url(url: str) -> tuple[str, str, str]:
         _, org, repo, _, ref = urlparse(url).path.split("/")
         return org, repo, ref
 
-    def url_to_short_ref(url: str) -> str:
-        org, repo, ref = split_github_url(url)
-        return f"{org}/{repo}#{ref}"
-
     pr_url = gh_json(f"pr view {pr_number}", "url")["url"]
-    pr_short_ref = url_to_short_ref(pr_url)
     pr_repo = split_github_url(pr_url)[1]
-
-    author = gh_json(f"pr view {pr_number}", "author")["author"]["login"]
 
     changed_files = gh_json(f"pr view {pr_number}", "files")["files"]
     changed_paths = [Path(file["path"]) for file in changed_files]
 
+    with (TEMPLATES_DIR / "_templating_exclude.json").open() as file_read:
+        ignore_dict = json.load(file_read)
+
+    def get_commit_authors(commit_json: dict) -> list[str]:
+        return [a["login"] for a in commit_json["authors"]]
+
     def get_all_authors() -> set[str]:
         """Get all the authors of all the commits in the PR."""
         commits = gh_json(f"pr view {pr_number}", "commits")["commits"]
-
-        def get_commit_authors(commit_json: dict) -> list[str]:
-            return [a["login"] for a in commit_json["authors"]]
 
         return set(
             commit_author
@@ -183,75 +267,109 @@ def prompt_share(args: argparse.Namespace) -> None:
             for commit_author in get_commit_authors(commit)
         )
 
-    if get_all_authors() - {"dependabot[bot]", "pre-commit-ci[bot]"} == set():
-        review_body = (
-            f"### [Templating]({SCITOOLS_URL}/.github/blob/main/templates)\n\n"
+    def post_review(review_body: str, review_type: ReviewType) -> None:
+        pr_int = pr_number
+        if pr_int == pr_url:
+            # Sometimes happens during local debugging.
+            pr_int = gh_json(f"pr view {pr_number}", "number")["number"]
+
+        # Find any existing templating reviews. Edit the last one if found.
+        gh_command = f"gh api repos/SciTools/{pr_repo}/pulls/{pr_int}/reviews"
+        existing_reviews = json.loads(check_output(shlex.split(gh_command)))
+        reviews_to_edit = [
+            review for review in existing_reviews
+            if review["body"].startswith(TEMPLATING_HEADING)
+        ]
+        if reviews_to_edit:
+            # Edit the last existing review.
+            review = reviews_to_edit[-1]
+            payload = json.dumps({"body": review_body})
+            gh_command = (
+                f"gh api --method PUT "
+                f"repos/SciTools/{pr_repo}/pulls/{pr_int}/reviews/{review['id']} "
+                f"--input -"
+            )
+            run(shlex.split(gh_command), input=payload.encode(), check=True)
+
+        else:
+            # Create a new review.
+            with NamedTemporaryFile("w") as file_write:
+                file_write.write(review_body)
+                file_write.flush()
+                gh_command = (
+                    f"gh pr review {pr_number} --{review_type.value} "
+                    f"--body-file {file_write.name}"
+                )
+                run(shlex.split(gh_command), check=True)
+
+    human_authors = get_all_authors() - set(BOTS)
+    if human_authors == set():
+        review_text = (
+            f"{TEMPLATING_HEADING}\n\n"
             "Version numbers are not typically covered by templating. It is "
             "expected that this PR is 100% about advancing version numbers, "
             "which would not require any templating follow-up. **Please double-"
             "check for any other changes that might be suitable for "
             "templating**."
         )
-        with NamedTemporaryFile("w") as file_write:
-            file_write.write(review_body)
-            file_write.flush()
-            gh_command = shlex.split(
-                f"gh pr review {pr_number} --comment --body-file {file_write.name}"
-            )
-            run(gh_command, check=True)
+        post_review(review_text, ReviewType.COMMENT)
         return
 
-    def create_issue(title: str, body: str) -> None:
-        # Check that an issue with this title isn't already on the .github repo.
-        existing_issues = gh_json(
-            "issue list --state all --repo SciTools/.github", "title"
-        )
-        if any(issue["title"] == title for issue in existing_issues):
-            return
+    templates_relative = TEMPLATES_DIR.relative_to(TEMPLATE_REPO_ROOT)
+    templates_url = f"{SCITOOLS_URL}/.github/tree/main/{templates_relative}"
+    body_intro = (
+        f"{TEMPLATING_HEADING}\n\n"
+        f"This PR includes changes that may be worth "
+        "sharing via templating. For each file listed below, please "
+        "either:\n\n"
+        "- Action the suggestion via a pull request editing/adding the "
+        f"relevant file in the [SciTools/.github `templates/` directory]({templates_url}). [^1]\n"
+        f"- Raise an issue against the [SciTools/.github repo]({SCITOOLS_URL}/.github) "
+        "for the above action if you _really_ don't have 10mins spare right now. "
+        "**Include an assignee**, to avoid it being forgotten.\n"
+        "- Dismiss the suggestion if the changes are not suitable for "
+        "templating.\n\n"
+        "You will need to dismiss this review before this PR can be merged. "
+        "**Recommend the reviewer does this as their final action before "
+        "merging**, as this text will continually update as commits come in."
+    )
 
-        with NamedTemporaryFile("w") as file_write:
-            file_write.write(body)
-            file_write.flush()
-            gh_command = shlex.split(
-                "gh issue create "
-                f'--title "{title}" '
-                f"--body-file {file_write.name} "
-                "--repo SciTools/.github "
-                f"--assignee {author}"
-            )
-            issue_url = check_output(gh_command).decode("utf-8").strip()
-        short_ref = url_to_short_ref(issue_url)
-        review_body = f"Please see {short_ref}"
-        gh_command = shlex.split(
-            f'gh pr review {pr_number} --request-changes --body "{review_body}"'
-        )
-        run(gh_command, check=True)
+    templated_list = []
+    body_templated = (
+        "\n### Templated files\n\n"
+        "The following changed files are templated:\n"
+    )
+
+    candidates_list = []
+    body_candidates = (
+        "\n### Template candidates\n\n"
+        "The following changed files are not currently templated, but their "
+        "parent directories suggest they may be good candidates for "
+        "a new template to be created:\n"
+    )
 
     for changed_path in changed_paths:
         template = CONFIG.find_template(pr_repo, changed_path)
         is_templated = template is not None
+        ignored = str(changed_path) in ignore_dict[pr_repo]
+        if ignored:
+            continue
+
+        changed_hash = sha256(str(changed_path).encode()).hexdigest()
+        changed_url = f"{pr_url}/files#diff-{changed_hash}"
+        changed_link = f"[`{changed_path}`]({changed_url})"
+
         if is_templated:
             template_relative = template.relative_to(TEMPLATE_REPO_ROOT)
             template_url = (
                 f"{SCITOOLS_URL}/.github/blob/main/{template_relative}"
             )
-            template_link = f"[`{template_relative}`]({template_url})"
+            template_link = f"[`SciTools/.github/{template_relative}`]({template_url})"
 
-            issue_title = (
-                f"Apply {pr_short_ref} `{changed_path}` improvements to "
-                f"`{template_relative}`?"
+            templated_list.append(
+                f"- [ ] {changed_link}, templated by {template_link}"
             )
 
-            issue_body = (
-                f"{pr_short_ref} (by @{author}) includes changes to "
-                f"`{changed_path}`. This file is templated by {template_link}. "
-                "Please either:\n\n"
-                "- Action this issue with a pull request applying the changes "
-                f"to {template_link}.\n"
-                "- Close this issue if the changes are not suitable for "
-                "templating."
-            )
-            create_issue(issue_title, issue_body)
         else:
             # Check if the file is in 'highly templated' locations. If so, worth
             #  prompting the user anyway.
@@ -265,31 +383,32 @@ def prompt_share(args: argparse.Namespace) -> None:
                 git_root / "benchmarks",
                 git_root / "docs" / "src",
             ):
-                issue_title = (
-                    f"Share {pr_short_ref} `{changed_path}` improvements via "
-                    f"templating?"
-                )
+                candidates_list.append(f"- [ ] {changed_link}")
 
-                templates_relative = TEMPLATES_DIR.relative_to(TEMPLATE_REPO_ROOT)
-                templates_url = f"{SCITOOLS_URL}/.github/tree/main/{templates_relative}"
-                templates_link = f"[`{templates_relative}/`]({templates_url})"
-                issue_body = (
-                    f"{pr_short_ref} (by @{author}) includes changes to "
-                    f"`{changed_path}`. This file is not currently templated, "
-                    "but its parent directory suggests it may be a good "
-                    "candidate. Please either:\n\n"
-                    "- Action this issue with a pull request adding a template "
-                    f"file to {templates_link}.\n"
-                    "- Close this issue if the file is not a good candidate "
-                    "for templating."
-                )
-                create_issue(issue_title, issue_body)
-            else:
-                continue
+    if templated_list or candidates_list:
+        body_args = [body_intro]
+        if templated_list:
+            body_args.append(body_templated)
+            body_args.extend(templated_list)
+        if candidates_list:
+            body_args.append(body_candidates)
+            body_args.extend(candidates_list)
+
+        tag, prose, word = MAGIC_NO_NOTIFY.pattern.split(": ")
+        pattern_repo = ": ".join([tag, prose, pr_repo])
+        body_args.append(
+            "\n\n[^1]: **Include this text in the PR body to avoid any "
+            "notifications about applying the template changes back to the "
+            "source repo!**\n"
+            f"``{pattern_repo}``"
+        )
+
+        review_text= "\n".join(body_args)
+        post_review(review_text, ReviewType.REQUEST_CHANGES)
 
 
 def check_dir(args: argparse.Namespace) -> None:
-    """Ensures templates/ dir aligns with _templating_config.json.
+    """Ensures templates/ dir aligns with _templating_include.json.
 
     This function is intended for running on the .github repo.
     """
@@ -300,7 +419,7 @@ def check_dir(args: argparse.Namespace) -> None:
     templates = [Path(TEMPLATES_DIR, template_name) for template_name in TEMPLATES_DIR.rglob("*")]
     for template in templates:
         if template.is_file():
-            assert template in CONFIG.templates, f"{template} is not in _templating_config.json"
+            assert template in CONFIG.templates, f"{template} is not in _templating_include.json"
 
 
 def main() -> None:
@@ -331,7 +450,7 @@ def main() -> None:
 
     check = subparsers.add_parser(
         "check_dir",
-        description="Check templates/ dir aligns with _templating_config.json.",
+        description="Check templates/ dir aligns with _templating_include.json.",
         epilog="This command is intended for running on the .github repo."
     )
     check.set_defaults(func=check_dir)
